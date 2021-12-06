@@ -1,19 +1,20 @@
 #!env python3
 
+from base64 import b64decode
 from contextlib import suppress
-import json
-import logging as log
-from types import SimpleNamespace
-import click
-import requests
-from requests_toolbelt.sessions import BaseUrlSession
-from requests_toolbelt.multipart.encoder import MultipartEncoder
 from dataclasses import dataclass
-from zipfile import ZipFile
 from gzip import GzipFile
 from io import BytesIO
 from itertools import islice
-from base64 import b64decode
+import json
+import logging as log
+from types import SimpleNamespace
+from zipfile import ZipFile
+
+import click
+import requests
+from requests_toolbelt.multipart.encoder import MultipartEncoder
+from requests_toolbelt.sessions import BaseUrlSession
 
 def paprika_recipes_count(file):
     """Return the number of recipes inside the export file."""
@@ -84,31 +85,71 @@ class Api:
         res = self.s.post('auth/token', data=credentials)
         self.s.auth = BearerAuth(res.json()['access_token'])
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.s.close()
+
     def post_recipe(self, recipe):
         """Create a new recipe from JSON"""
         url = f"{self.base}recipes/create"
-        return self.s.post(url, json=recipe)
+        res = self.s.post(url, json=recipe)
+        if res.ok:
+            log.info(f"Successfully imported recipe '{recipe['name']}'")
+        else:
+            log.error(f"Error while importing recipe '{recipe['name']}'")
+            log.error(f"Code: {res.status_code}")
+            log.error(f"{res.content}")
+        return res
+
 
     def put_image(self, slug, image, extension):
         """Upload a new image for a given recipe"""
         data = MultipartEncoder(
             fields={
                 'image': ('image.jpg', image, 'image/jpeg'),
-                'extension': extension}
-        )
-        return self.s.put(
+                'extension': extension})
+        res = self.s.put(
             f"recipes/{slug}/image",
             data=data,
-            headers={'Content-Type': data.content_type}
-        )
+            headers={'Content-Type': data.content_type})
+        if res.ok:
+            log.info(f"Successfully imported image for recipe recipe '{slug}'")
+        else:
+            log.warn(f"Error while importing image for recipe '{slug}'")
+            log.warn(f"Code: {res.status_code}")
+            log.warn(f"{res.content}")
+        return res
 
     def post_image(self, slug, url):
         """Scrape an image for a given recipe"""
-        return self.s.post(
+        res = self.s.post(
             f"recipes({slug}/image",
-            json={'url': url},
-        )
+            json={'url': url})
+        if res.ok:
+            log.info(f"Successfully scraped image for recipe recipe '{slug}'")
+        else:
+            log.warn(f"Error while scraping image for recipe '{slug}' from '{url}'")
+            log.warn(f"Code: {res.status_code}")
+            log.warn(f"{res.content}")
+        return res
 
+
+    def import_paprika_recipe(self, recipe):
+        """Import a recipe in Paprika's JSON Format to Mealie"""
+        res = self.post_recipe(convert_recipe(recipe))
+        if(res.ok):
+            slug = res.text[1:-1]
+            # Upload the (low quality) image from the export
+            with(suppress(TypeError)):
+                image = BytesIO(b64decode(recipe['photo_data']))
+                self.put_image(slug, image, 'jpg')
+            # Try to re-scrape and overwrite the low-quality image with
+            # a better image.
+            image_url = recipe['image_url']
+            self.post_image(slug, image_url)
+        return res.ok
 
 @click.command()
 @click.argument('file', type=click.File('rb'))
@@ -121,40 +162,24 @@ class Api:
     confirmation_prompt=False,
     help='Password of the mealie user. Prompt if omitted.')
 @click.option(
-    '--log',
+    '--logfile',
     type=click.Path(writable=True, dir_okay=False),
     default='pap2mealie.log',
     help='Path to the log file.')
-def pap2mealie(file, url, username, password, log):
-    log.basicConfig(level=log.INFO, filename=log)
+def pap2mealie(file, url, username, password, logfile):
+    log.basicConfig(level=log.INFO, filename=logfile)
     ok = 0
-    nok = 0
-    api = Api(f"{url}/api/", username, password)
-    with click.progressbar(
-        paprika_recipes(file),
-        length=paprika_recipes_count(file),
-        label='Importing recipes'
-    ) as bar:
-        for recipe in bar:
-            res = api.post_recipe(convert_recipe(recipe))
-            if(res.ok):
-                log.info(f"Successfully imported recipe '{recipe['name']}'")
-                slug = res.text[1:-1]
-                # Upload the (low quality) image from the export
-                with(suppress(TypeError)):
-                    image = BytesIO(b64decode(recipe['photo_data']))
-                    api.put_image(slug, image, 'jpg')
-                # Try to re-scrape and overwrite the low-quality image with
-                # a better image.
-                image_url = recipe['image_url']
-                api.post_image(slug, image_url)
-            else:
-                nok += 1
-                log.error(f"Error while importing recipe '{recipe['name']}'")
-                log.error(f"Code: {res.status_code}")
-                log.error(f"{res.content}")
+    num_recipes = paprika_recipes_count(file)
+    with Api(f"{url}/api/", username, password) as api:
+        with click.progressbar(paprika_recipes(file),
+            length=num_recipes,
+            label='Importing recipes'
+        ) as recipes:
+            for recipe in recipes:
+                if api.import_paprika_recipe(recipe):
+                    ok += 1
     click.echo(f"Imported: {ok}")
-    click.echo(f"Errors: {nok}")
+    click.echo(f"Errors: {num_recipes - ok}")
     click.echo('See log for details.')
 
 if __name__ == '__main__':
